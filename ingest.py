@@ -1,3 +1,4 @@
+from bm25_index import bm25_index
 from chunker import semantic_chunk, fixed_chunk
 import pdfplumber
 import uuid
@@ -54,6 +55,9 @@ def ingest_pdf(file_path: str, filename: str) -> dict:
         documents=chunks,
         metadatas=metadatas
     )
+
+    # Index the same chunks in BM25 for keyword search
+    bm25_index.add(chunks, metadatas)
 
     return {
         "filename": filename,
