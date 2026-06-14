@@ -7,7 +7,13 @@ import shutil
 import os
 import chromadb
 
-from ingest import ingest_pdf, ingest_structured, STRUCTURED_EXTENSIONS
+from ingest import (
+    ingest_pdf,
+    ingest_structured,
+    ingest_document,
+    STRUCTURED_EXTENSIONS,
+    DOCUMENT_EXTENSIONS
+)
 from retriever import retrieve_with_routing
 from generator import generate_answer
 
@@ -28,6 +34,7 @@ os.makedirs("uploads", exist_ok=True)
 # All supported extensions
 PDF_EXTENSIONS = {'.pdf'}
 STRUCTURED_EXTS = set(STRUCTURED_EXTENSIONS.keys())
+DOCUMENT_EXTS = set(DOCUMENT_EXTENSIONS.keys())
 
 @app.get("/")
 def health_check():
@@ -44,7 +51,7 @@ async def upload_file(file: UploadFile = File(...)):
     ext = os.path.splitext(filename)[1].lower()
 
     # Validate extension
-    all_supported = PDF_EXTENSIONS | STRUCTURED_EXTS
+    all_supported = PDF_EXTENSIONS | STRUCTURED_EXTS | DOCUMENT_EXTS
     if ext not in all_supported:
         raise HTTPException(
             status_code=400,
@@ -60,8 +67,10 @@ async def upload_file(file: UploadFile = File(...)):
     try:
         if ext == '.pdf':
             result = ingest_pdf(file_path, filename)
-        else:
+        elif ext in STRUCTURED_EXTS:
             result = ingest_structured(file_path, filename)
+        else:
+            result = ingest_document(file_path, filename)  # ← catches docx, txt, md, epub
     finally:
         # Always clean up — even if ingestion fails
         if os.path.exists(file_path):
@@ -202,3 +211,33 @@ def debug_chunks():
             )
         ]
     }
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    filename = file.filename
+    ext = os.path.splitext(filename)[1].lower()
+
+    all_supported = PDF_EXTENSIONS | STRUCTURED_EXTS | DOCUMENT_EXTS
+
+    if ext not in all_supported:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Supported: {sorted(all_supported)}"
+        )
+
+    file_path = f"uploads/{filename}"
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        if ext == '.pdf':
+            result = ingest_pdf(file_path, filename)
+        elif ext in STRUCTURED_EXTS:
+            result = ingest_structured(file_path, filename)
+        else:
+            result = ingest_document(file_path, filename)
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    return result

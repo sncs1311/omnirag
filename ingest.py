@@ -1,3 +1,4 @@
+from document_parser import parse_docx, parse_txt, parse_markdown, parse_epub
 from entity_graph import entity_graph, extract_entities
 from structured_parser import parse_excel, parse_csv, parse_json, parse_xml
 from bm25_index import bm25_index
@@ -99,6 +100,16 @@ STRUCTURED_EXTENSIONS = {
     '.csv': parse_csv,
     '.json': parse_json,
     '.xml': parse_xml,
+}
+
+# New — text-primary documents
+DOCUMENT_EXTENSIONS = {
+    '.docx': parse_docx,
+    '.doc': parse_docx,   # python-docx handles .doc too
+    '.txt': parse_txt,
+    '.md': parse_markdown,
+    '.markdown': parse_markdown,
+    '.epub': parse_epub,
 }
 
 def ingest_structured(file_path: str, filename: str) -> dict:
@@ -240,3 +251,85 @@ def split_section_into_subchunks(text: str, header: str, max_size: int = 400) ->
         sub_chunks.append(current.strip())
 
     return sub_chunks
+
+def ingest_document(file_path: str, filename: str) -> dict:
+    """
+    Route text-primary documents to correct parser.
+    Parser returns {text: str, ...}.
+    Text handed to existing chunking → embedding → ChromaDB pipeline.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+    parser = DOCUMENT_EXTENSIONS.get(ext)
+
+    if not parser:
+        return {"error": f"Unsupported document format: {ext}"}
+
+    # Parse — get clean text
+    parse_result = parser(file_path, filename)
+
+    if "error" in parse_result:
+        return parse_result
+
+    text = parse_result.get("text", "")
+    if not text.strip():
+        return {"error": f"No text could be extracted from {filename}"}
+
+    # Detect structured vs flowing document
+    if is_structured_document(text):
+        chunks = section_aware_chunk(text)
+        chunking_method = "section_aware"
+    else:
+        try:
+            chunks = semantic_chunk(text)
+            chunking_method = "semantic" if len(chunks) >= 3 else "fixed_fallback"
+            if len(chunks) < 3:
+                chunks = fixed_chunk(text)
+        except Exception as e:
+            print(f"Semantic chunking failed: {e}")
+            chunks = fixed_chunk(text)
+            chunking_method = "fixed_fallback"
+
+    if not chunks:
+        return {"error": "Document produced no usable chunks after parsing"}
+
+    # Embed + store — identical to PDF pipeline
+    embeddings = model.encode(chunks).tolist()
+    ids = [str(uuid.uuid4()) for _ in chunks]
+    metadatas = [
+        {
+            "filename": filename,
+            "chunk_index": i,
+            "total_chunks": len(chunks),
+            "file_type": parse_result.get("type", ext)
+        }
+        for i in range(len(chunks))
+    ]
+
+    collection.add(
+        ids=ids,
+        embeddings=embeddings,
+        documents=chunks,
+        metadatas=metadatas
+    )
+
+    bm25_index.add(chunks, metadatas)
+
+    # Entity graph
+    for chunk, chunk_id in zip(chunks, ids):
+        entities = extract_entities(chunk, chunk_id, filename)
+        entity_graph.add_chunk_entities(entities)
+
+    # Build result
+    result = {
+        "filename": filename,
+        "file_type": parse_result.get("type", ext),
+        "chunks_stored": len(chunks),
+        "chunking_method": chunking_method
+    }
+
+    # Add parser-specific info
+    for key in ["sections_found", "tables_found", "chapters_found", "code_blocks_found"]:
+        if key in parse_result:
+            result[key] = parse_result[key]
+
+    return result
