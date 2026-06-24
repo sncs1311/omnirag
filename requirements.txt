@@ -29,11 +29,3 @@ networkx==3.2.1
 # Code parsing
 tree-sitter==0.21.3
 
-# OCR (Phase 10+)
-# pytesseract==0.3.10
-# opencv-python==4.9.0.80
-# Pillow==10.2.0
-
-# Uncomment Phase 10+ when ready:
-# transformers==4.38.1   # TrOCR
-# torch==2.2.0           # TrOCR dependency

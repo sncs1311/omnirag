@@ -49,27 +49,49 @@ def health_check():
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """
-    Accepts PDF and structured data files.
-    Routes each to the correct ingestion pipeline.
-    """
     filename = file.filename
     ext = os.path.splitext(filename)[1].lower()
 
-    # Validate extension
-    all_supported = PDF_EXTENSIONS | STRUCTURED_EXTS | DOCUMENT_EXTS | PPTX_EXTS | CODE_EXTS
+    all_supported = (PDF_EXTENSIONS | STRUCTURED_EXTS | DOCUMENT_EXTS |
+                     PPTX_EXTS | CODE_EXTS)
+
     if ext not in all_supported:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type: {ext}. Supported: {sorted(all_supported)}"
+            detail=f"Unsupported file type '{ext}'. Supported: {sorted(all_supported)}"
         )
 
-    # Save temporarily
+    # ── NEW: auto-clear previous data before every upload ────────────────
+    # Single-document mode — always replace, never accumulate
+    global collection, client
+    try:
+        client.delete_collection("documents")
+        collection = client.get_or_create_collection("documents")
+
+        import retriever, ingest
+        retriever.collection = collection
+        ingest.collection = collection
+    except Exception:
+        pass  # collection might not exist yet on first run — fine
+
+    from bm25_index import BM25_INDEX_PATH
+    from entity_graph import GRAPH_PATH
+    from structured_parser import SQLITE_DB_PATH
+
+    for path in [BM25_INDEX_PATH, GRAPH_PATH, SQLITE_DB_PATH]:
+        if os.path.exists(path):
+            os.remove(path)
+
+    bm25_index.corpus = []
+    bm25_index.chunks = []
+    bm25_index.bm25 = None
+    entity_graph.graph.clear()
+    # ── END auto-clear ─────────────────────────────────────────────────────
+
     file_path = f"uploads/{filename}"
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Route to correct pipeline
     try:
         if ext == '.pdf':
             result = ingest_pdf(file_path, filename)
@@ -82,7 +104,6 @@ async def upload_file(file: UploadFile = File(...)):
         else:
             result = ingest_document(file_path, filename)
     finally:
-        # Always clean up — even if ingestion fails
         if os.path.exists(file_path):
             os.remove(file_path)
 
@@ -251,3 +272,4 @@ async def upload_file(file: UploadFile = File(...)):
             os.remove(file_path)
 
     return result
+

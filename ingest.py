@@ -563,3 +563,4 @@ def ingest_code(file_path: str, filename: str) -> dict:
         "chunks_stored": total,
         "imports_found": len(parse_result.get("imports", []))
     }
+

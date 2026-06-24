@@ -142,3 +142,39 @@ def confidence_label(score: float) -> str:
         return "medium"
     else:
         return "high"
+    
+def find_closest_terms(query: str, all_chunks_text: list[str], top_n: int = 3) -> list[str]:
+    """
+    When nothing matches well, find terms in the document
+    that are closest to the query — for 'did you mean X' suggestions.
+
+    Uses simple substring and fuzzy matching — no extra ML model needed.
+    """
+    from difflib import get_close_matches
+
+    query_words = extract_content_words(query)
+    if not query_words:
+        return []
+
+    # Build vocabulary from all chunk text
+    all_words = set()
+    for text in all_chunks_text:
+        all_words.update(extract_content_words(text))
+
+    if not all_words:
+        return []
+
+    suggestions = []
+    for qword in query_words:
+        matches = get_close_matches(qword, all_words, n=top_n, cutoff=0.6)
+        suggestions.extend(matches)
+
+    # Deduplicate, keep order
+    seen = set()
+    unique = []
+    for s in suggestions:
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+
+    return unique[:top_n]
