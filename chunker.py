@@ -4,6 +4,9 @@ import re
 
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
+# Batch size for encoding — tune down if you hit OOM on very large docs
+ENCODE_BATCH_SIZE = 512
+
 
 # ── Utility: cosine similarity between two vectors ────────────────────────
 
@@ -84,65 +87,97 @@ def find_hard_boundaries(text: str) -> list[str]:
 def semantic_chunk(text: str, threshold: float = 0.3, min_chunk_size: int = 2) -> list[str]:
     """
     Main chunking function. Two-pass approach:
-    
+
     Pass 1: Split at hard structural boundaries (pages, paragraphs)
     Pass 2: Within each section, split further at semantic topic changes
-    
+
+    KEY OPTIMISATION: all sentences across ALL sections are encoded in a
+    single model.encode() call (one GPU/CPU batch). Previously this was
+    called once per section, causing hundreds of sequential encode calls
+    on large documents — this was the primary bottleneck for 500+ page files.
+
     threshold: cosine similarity below this = new chunk
         Lower (0.2) = more, smaller chunks
         Higher (0.5) = fewer, larger chunks
         0.3 is a good default for academic/business documents
-    
+
     min_chunk_size: minimum sentences per chunk
         Prevents single-sentence orphan chunks with no context
     """
-    
+
     # Pass 1 — structural splits
     sections = find_hard_boundaries(text)
-    
-    all_chunks = []
-    
-    for section in sections:
-        # Split section into sentences
+
+    # ── Collect all sentences from all sections up-front ─────────────────
+    # We track which sentences belong to which section so we can stitch
+    # them back together after the single batch encode.
+
+    section_sentences: list[list[str]] = []   # sentences per section
+    short_sections: list[tuple[int, str]] = [] # (section_idx, text) for tiny sections
+
+    flat_sentences: list[str] = []             # all sentences, flattened
+    flat_offsets: list[int] = []               # start index in flat_sentences per section
+
+    for idx, section in enumerate(sections):
         sentences = split_into_sentences(section)
-        
-        # Skip sections too short to meaningfully chunk
+
         if len(sentences) <= min_chunk_size:
-            if section.strip():
-                all_chunks.append(section.strip())
+            # Too short for semantic analysis — keep as-is
+            short_sections.append((idx, section.strip()))
+            section_sentences.append([])        # placeholder to keep indices aligned
+            flat_offsets.append(len(flat_sentences))
+        else:
+            section_sentences.append(sentences)
+            flat_offsets.append(len(flat_sentences))
+            flat_sentences.extend(sentences)
+
+    # ── Single batch encode — the key performance fix ─────────────────────
+    # All sentences from the entire document encoded in one call.
+    # batch_size controls memory; 512 works well up to ~2000 pages.
+    all_embeddings: list = []
+    if flat_sentences:
+        all_embeddings = model.encode(
+            flat_sentences,
+            batch_size=ENCODE_BATCH_SIZE,
+            show_progress_bar=False,
+        ).tolist()
+
+    # ── Pass 2 — semantic splits using the pre-computed embeddings ────────
+    all_chunks: list[str] = []
+
+    # Reconstruct a section_idx → (is_short, text_or_sentences) map
+    short_section_map = {idx: txt for idx, txt in short_sections}
+
+    for idx, section in enumerate(sections):
+        if idx in short_section_map:
+            if short_section_map[idx]:
+                all_chunks.append(short_section_map[idx])
             continue
-        
-        # Embed all sentences at once (batching = faster)
-        embeddings = model.encode(sentences).tolist()
-        
-        # Pass 2 — semantic splits within this section
+
+        sentences = section_sentences[idx]
+        offset = flat_offsets[idx]
+        embeddings = all_embeddings[offset: offset + len(sentences)]
+
         current_chunk = [sentences[0]]
-        
+
         for i in range(1, len(sentences)):
-            # Compare this sentence with the previous one
-            similarity = cosine_similarity(embeddings[i-1], embeddings[i])
-            
+            similarity = cosine_similarity(embeddings[i - 1], embeddings[i])
+
             if similarity < threshold:
-                # Topic changed — close current chunk, start new one
-                # But only if current chunk meets minimum size
                 if len(current_chunk) >= min_chunk_size:
                     all_chunks.append(' '.join(current_chunk))
                     current_chunk = [sentences[i]]
                 else:
-                    # Chunk too small — absorb this sentence anyway
-                    # Better a slightly off-topic sentence than an orphan chunk
                     current_chunk.append(sentences[i])
             else:
-                # Same topic — keep building this chunk
                 current_chunk.append(sentences[i])
-        
-        # Don't forget the last chunk
+
         if current_chunk:
             all_chunks.append(' '.join(current_chunk))
-    
+
     # Final cleanup — remove any empty chunks
     all_chunks = [c.strip() for c in all_chunks if len(c.strip()) > 20]
-    
+
     return all_chunks
 
 

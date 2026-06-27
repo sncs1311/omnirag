@@ -23,36 +23,30 @@ def reciprocal_rank_fusion(
     Merge two ranked result lists without needing comparable scores.
 
     RRF formula: score += 1 / (k + rank)
-    
+
     k=60 is the empirically optimal constant from the original paper
     (Cormack, Clarke, Buettcher 2009). It prevents very high-ranked
     results from dominating — smooths the influence of rank position.
-    
+
     A chunk appearing at rank 1 in both lists scores higher than
     one appearing at rank 1 in one list and rank 50 in another.
     """
     rrf_scores = {}   # chunk_text → accumulated RRF score
     chunk_data = {}   # chunk_text → full chunk dict (for returning results)
 
-    # Process vector search results
     for rank, chunk in enumerate(vector_results):
         key = chunk["text"]
         rrf_scores[key] = rrf_scores.get(key, 0) + 1 / (k + rank + 1)
         chunk_data[key] = chunk
 
-    # Process BM25 results — accumulate into same scores dict
     for rank, chunk in enumerate(bm25_results):
         key = chunk["text"]
         rrf_scores[key] = rrf_scores.get(key, 0) + 1 / (k + rank + 1)
-        # If this chunk also appeared in vector results, keep that version
-        # (it has distance metadata). Otherwise use BM25 version.
         if key not in chunk_data:
             chunk_data[key] = chunk
 
-    # Sort by accumulated RRF score — highest first
     sorted_keys = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True)
 
-    # Build final result list with RRF scores attached
     merged = []
     for key in sorted_keys:
         chunk = chunk_data[key].copy()
@@ -77,7 +71,6 @@ def vector_search(query: str, n_results: int = 10) -> list[dict]:
         include=["documents", "metadatas", "distances"]
     )
 
-    # collection.count() == 0 means no documents ingested yet
     if not results["documents"][0]:
         return []
 
@@ -88,7 +81,6 @@ def vector_search(query: str, n_results: int = 10) -> list[dict]:
             "filename": results["metadatas"][0][i]["filename"],
             "chunk_index": results["metadatas"][0][i]["chunk_index"],
             "distance": results["distances"][0][i],
-            # Convert distance to relevance score: 0 distance = 1.0 score
             "relevance_score": round(1 - results["distances"][0][i], 3)
         })
 
@@ -100,33 +92,22 @@ def vector_search(query: str, n_results: int = 10) -> list[dict]:
 def retrieve(query: str, n_results: int = 5) -> list[dict]:
     """
     Hybrid retrieval: vector search + BM25, merged via RRF.
-    
-    We fetch 2x n_results from each search before merging.
-    More candidates = RRF has better material to work with.
-    After merging and deduplication, we trim to n_results.
-    
-    Falls back to vector-only if BM25 index is empty.
+    Uses the rewritten query for best retrieval accuracy.
     """
-    # Fetch more than needed from each — RRF needs candidates
     fetch_n = n_results * 2
 
-    # Run both searches
     vec_results = vector_search(query, fetch_n)
     bm25_results = bm25_index.search(query, fetch_n)
 
-    # If BM25 has nothing (no documents ingested yet) — vector only
     if not bm25_results:
         return vec_results[:n_results]
 
-    # If ChromaDB has nothing — BM25 only (shouldn't happen but be safe)
     if not vec_results:
         return bm25_results[:n_results]
 
-    # Merge with Reciprocal Rank Fusion
     merged = reciprocal_rank_fusion(vec_results, bm25_results)
-
-    # Return top n_results after merging
     return merged[:n_results]
+
 
 SUMMARY_SIGNALS = [
     r'\bsummar(y|ise|ize)\b',
@@ -142,14 +123,53 @@ def is_summary_query(query: str) -> bool:
     q = query.lower().strip().rstrip('?!.')
     return any(re.search(p, q) for p in SUMMARY_SIGNALS)
 
-def retrieve_with_routing(query: str, n_results: int = 5) -> dict:
 
+def fetch_chunks_by_ids(chunk_ids: list[str]) -> list[dict]:
+    """Fetch specific chunks from ChromaDB by their IDs."""
+    try:
+        result = collection.get(ids=chunk_ids, include=["documents", "metadatas"])
+        chunks = []
+        for i, doc in enumerate(result["documents"]):
+            chunks.append({
+                "text": doc,
+                "filename": result["metadatas"][i].get("filename", "unknown"),
+                "chunk_index": result["metadatas"][i].get("chunk_index", 0),
+                "distance": 0.2,  # neutral fallback for graph-sourced chunks
+            })
+        return chunks
+    except Exception:
+        return []
+
+
+def retrieve_with_routing(
+    query: str,
+    n_results: int = 5,
+    rewritten_query: str | None = None,
+    history: list[dict] | None = None
+) -> dict:
+    """
+    Main retrieval entrypoint.
+
+    Parameters
+    ----------
+    query           : the original user question (used for display/history)
+    n_results       : how many chunks to return
+    rewritten_query : typo-fixed, context-resolved version from conversation_manager.
+                      Used for actual retrieval. Falls back to `query` if not provided.
+    history         : recent conversation turns passed through to the generator
+                      so the LLM can answer follow-ups coherently.
+    """
+    # Use rewritten query for retrieval if available, otherwise original
+    retrieval_query = rewritten_query if rewritten_query else query
+    history = history or []
+
+    # ── Structured data routes (use rewritten query for better SQL matching) ──
     from sql_router import describe_structured_data
-    desc_result = describe_structured_data(query)
+    desc_result = describe_structured_data(retrieval_query)
     if desc_result:
         return desc_result
 
-    sql_result = try_sql_route(query)
+    sql_result = try_sql_route(retrieval_query)
     if sql_result:
         return sql_result
 
@@ -160,22 +180,14 @@ def retrieve_with_routing(query: str, n_results: int = 5) -> dict:
             "sources": [], "route": "none"
         }
 
-    # ── Summary handling — triggered by phrasing OR as a fallback below ────
+    # ── Summary path ──────────────────────────────────────────────────────
     def run_summary_path():
-        """
-        Pulls a SPREAD of chunks across the whole document — not just
-        the first N in insertion order — so a multi-page PDF or
-        multi-slide deck gets representative coverage, not just page 1.
-        """
         total = collection.count()
         sample_size = min(10, total)
 
         if total <= sample_size:
-            # Small doc — just grab everything
             sample = collection.get(include=["documents", "metadatas"])
         else:
-            # Spread evenly across the whole document using ChromaDB's
-            # internal ordering as a proxy for chunk position
             all_ids = collection.get(include=[])["ids"]
             step = max(1, len(all_ids) // sample_size)
             picked_ids = all_ids[::step][:sample_size]
@@ -187,30 +199,29 @@ def retrieve_with_routing(query: str, n_results: int = 5) -> dict:
         combined = '\n\n---\n\n'.join(sample["documents"])
         filename = sample["metadatas"][0].get("filename", "document") if sample["metadatas"] else "document"
 
-        fake_chunks = [{
-            "text": combined,
-            "filename": filename,
-            "distance": 0.1
-        }]
+        fake_chunks = [{"text": combined, "filename": filename, "distance": 0.1}]
 
         from generator import generate_answer
         result = generate_answer(
             "Provide a clear, well-organised summary of what this document covers overall, "
             "based on the passages provided.",
-            fake_chunks
+            fake_chunks,
+            history=history   # ← pass history even on summary path
         )
         result["route"] = "summary"
         return result
 
-    if is_summary_query(query):
+    if is_summary_query(retrieval_query):
         summary_result = run_summary_path()
         if summary_result:
             return summary_result
-    # ── End explicit summary handling ───────────────────────────────────────
+    # ── End summary ───────────────────────────────────────────────────────
 
-    raw_chunks = retrieve(query, n_results * 2)
+    # ── Hybrid retrieval (rewritten query) ────────────────────────────────
+    raw_chunks = retrieve(retrieval_query, n_results * 2)
 
-    graph_chunk_ids = entity_graph.query_graph(query)
+    # Entity graph augmentation
+    graph_chunk_ids = entity_graph.query_graph(retrieval_query)
     if graph_chunk_ids:
         graph_chunks = fetch_chunks_by_ids(graph_chunk_ids)
         seen_texts = {c["text"] for c in raw_chunks}
@@ -219,23 +230,21 @@ def retrieve_with_routing(query: str, n_results: int = 5) -> dict:
                 raw_chunks.append(gc)
                 seen_texts.add(gc["text"])
 
-    filtered_chunks = filter_chunks(raw_chunks, query)
+    filtered_chunks = filter_chunks(raw_chunks, retrieval_query)
 
-    # ── Fallback: if normal retrieval found nothing, try summary mode ──────
-    # This is the real safety net — catches vague questions that didn't
-    # match the SUMMARY_SIGNALS regex but also don't match specific content
+    # ── Fallback to summary if retrieval found nothing ────────────────────
     if not filtered_chunks:
         summary_result = run_summary_path()
         if summary_result:
             summary_result["route"] = "summary_fallback"
             return summary_result
-    # ── End fallback ─────────────────────────────────────────────────────────
 
+    # ── Abstention with fuzzy suggestions ────────────────────────────────
     if not filtered_chunks:
         from corrective_filter import find_closest_terms
 
         all_text = [c["text"] for c in raw_chunks]
-        suggestions = find_closest_terms(query, all_text)
+        suggestions = find_closest_terms(retrieval_query, all_text)
 
         if suggestions:
             suggestion_list = ', '.join(f'"{s}"' for s in suggestions)
@@ -257,8 +266,9 @@ def retrieve_with_routing(query: str, n_results: int = 5) -> dict:
             "route": "vector_abstained"
         }
 
+    # ── Generate answer with history ──────────────────────────────────────
     filtered_chunks = filtered_chunks[:n_results]
     from generator import generate_answer
-    result = generate_answer(query, filtered_chunks)
+    result = generate_answer(query, filtered_chunks, history=history)
     result["route"] = "vector+graph"
     return result

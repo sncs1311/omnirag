@@ -1,7 +1,7 @@
 import sqlite3
 import requests
 import re
-from structured_parser import get_db_connection, get_table_schema
+from structured_parser import get_db_connection, get_table_schema, get_full_schema_with_originals
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
@@ -22,7 +22,7 @@ def has_structured_data() -> bool:
     """
     try:
         conn = get_db_connection()
-        schema = get_table_schema(conn)
+        schema = get_full_schema_with_originals(conn)
         conn.close()
         return len(schema) > 0
     except Exception:
@@ -154,7 +154,7 @@ def describe_structured_data(query: str) -> dict | None:
         return None
 
     conn = get_db_connection()
-    schema = get_table_schema(conn)
+    schema = get_full_schema_with_originals(conn)
 
     # Get row counts per table
     descriptions = []
@@ -252,7 +252,7 @@ def try_sql_route(query: str) -> dict | None:
     
     # Get schema
     conn = get_db_connection()
-    schema = get_table_schema(conn)
+    schema = get_full_schema_with_originals(conn)
     conn.close()
 
     if not schema:
@@ -293,6 +293,11 @@ DOCUMENT_SIGNALS = [
     r'\bwhat is this\b', r'\bdescribe this\b',
     r'\bsummarise\b', r'\bsummarize\b', r'\boverview\b',
     r'\bwhat does this contain\b', r'\bwhat kind of data\b',
+    r'\bwhat does this image\b',    # ← add these
+    r'\bwhat is in this image\b',
+    r'\bwhat does the image\b',
+    r'\bwhat does the scan\b',
+    r'\bwhat was scanned\b',
 ]
 
 def is_document_level_question(query: str) -> bool:

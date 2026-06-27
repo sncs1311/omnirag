@@ -47,23 +47,6 @@ def ingest_pdf(file_path: str, filename: str) -> dict:
             chunks = fixed_chunk(all_text)
             chunking_method = "fixed_fallback"
 
-    # NEW — Phase 2: semantic chunking with fixed fallback
-    try:
-        chunks = semantic_chunk(all_text)
-
-        # Safety net: if semantic chunking returns too few chunks
-        # (can happen with very short or poorly formatted PDFs)
-        if len(chunks) < 3:
-            chunks = fixed_chunk(all_text)
-            chunking_method = "fixed_fallback"
-        else:
-            chunking_method = "semantic"
-
-    except Exception as e:
-        # If semantic chunking crashes on weird input, fall back gracefully
-        print(f"Semantic chunking failed: {e}. Using fixed chunking.")
-        chunks = fixed_chunk(all_text)
-        chunking_method = "fixed_fallback"
     embeddings = model.encode(chunks).tolist()
 
     ids = [str(uuid.uuid4()) for _ in chunks]
@@ -79,11 +62,8 @@ def ingest_pdf(file_path: str, filename: str) -> dict:
         metadatas=metadatas
     )
 
-    # Index the same chunks in BM25 for keyword search
     bm25_index.add(chunks, metadatas)
 
-    # ── Phase 6: entity extraction → graph ───────────────────────
-    # Extract entities from each chunk and add to knowledge graph
     for i, (chunk, chunk_id) in enumerate(zip(chunks, ids)):
         entities = extract_entities(chunk, chunk_id, filename)
         entity_graph.add_chunk_entities(entities)

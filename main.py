@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from bm25_index import bm25_index
 import shutil
 import os
+import uuid
 import chromadb
 
 from ingest import (
@@ -20,15 +21,17 @@ from ingest import (
 )
 from retriever import retrieve_with_routing
 from generator import generate_answer
+from conversation_manager import session_store, process_query, record_turn
 
 client = chromadb.PersistentClient(path="./chroma_store")
 collection = client.get_or_create_collection("documents")
 
-app = FastAPI(title="OmniRAG", version="0.1.0 — Phase 1")
+app = FastAPI(title="OmniRAG", version="0.2.0 — Conversational")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -44,7 +47,7 @@ CODE_EXTS = CODE_EXTENSIONS
 
 @app.get("/")
 def health_check():
-    return {"status": "OmniRAG is running", "phase": 1}
+    return {"status": "OmniRAG is running", "version": "0.2.0"}
 
 
 @app.post("/upload")
@@ -61,8 +64,7 @@ async def upload_file(file: UploadFile = File(...)):
             detail=f"Unsupported file type '{ext}'. Supported: {sorted(all_supported)}"
         )
 
-    # ── NEW: auto-clear previous data before every upload ────────────────
-    # Single-document mode — always replace, never accumulate
+    # Auto-clear previous data before every upload (single-document mode)
     global collection, client
     try:
         client.delete_collection("documents")
@@ -72,7 +74,7 @@ async def upload_file(file: UploadFile = File(...)):
         retriever.collection = collection
         ingest.collection = collection
     except Exception:
-        pass  # collection might not exist yet on first run — fine
+        pass
 
     from bm25_index import BM25_INDEX_PATH
     from entity_graph import GRAPH_PATH
@@ -86,7 +88,6 @@ async def upload_file(file: UploadFile = File(...)):
     bm25_index.chunks = []
     bm25_index.bm25 = None
     entity_graph.graph.clear()
-    # ── END auto-clear ─────────────────────────────────────────────────────
 
     file_path = f"uploads/{filename}"
     with open(file_path, "wb") as buffer:
@@ -110,45 +111,86 @@ async def upload_file(file: UploadFile = File(...)):
     return result
 
 
+# ── Query models ──────────────────────────────────────────────────────────
+
 class QueryRequest(BaseModel):
     question: str
     n_results: int = 5
+    session_id: str | None = None   # optional; auto-created if missing
 
+
+class SessionResponse(BaseModel):
+    session_id: str
+
+
+# ── Query endpoint ────────────────────────────────────────────────────────
 
 @app.post("/query")
 def query_documents(request: QueryRequest):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-    # retrieve_with_routing handles both SQL and vector paths
-    return retrieve_with_routing(request.question, request.n_results)
+    # Resolve or create session
+    session_id = request.session_id or str(uuid.uuid4())
+
+    # Rewrite query (typo fix + follow-up resolution) and fetch history
+    rewritten_query, history = process_query(request.question, session_id)
+
+    # Retrieve and generate — pass both original + rewritten query
+    result = retrieve_with_routing(
+        query=request.question,          # original — used for display & history
+        n_results=request.n_results,
+        rewritten_query=rewritten_query, # used for actual retrieval
+        history=history                  # passed to generator for context
+    )
+
+    # Save this turn to history (original question + answer)
+    record_turn(session_id, request.question, result.get("answer", ""))
+
+    # Always echo back the session_id so the frontend can send it next time
+    result["session_id"] = session_id
+
+    # Show what the query was rewritten to (useful for debugging / UI display)
+    if rewritten_query != request.question:
+        result["rewritten_query"] = rewritten_query
+
+    return result
+
+
+# ── Session management endpoints ──────────────────────────────────────────
+
+@app.post("/session/new", response_model=SessionResponse)
+def new_session():
+    """Create a fresh conversation session. Returns the session ID."""
+    sid = session_store.new_session()
+    return {"session_id": sid}
+
+
+@app.delete("/session/{session_id}")
+def clear_session(session_id: str):
+    """Clear conversation history for a session (e.g. 'Start over')."""
+    session_store.clear(session_id)
+    return {"message": f"Session {session_id} cleared."}
+
+
+# ── Existing endpoints (unchanged) ────────────────────────────────────────
 
 @app.get("/graph")
 def get_graph():
-    """
-    Returns the full entity knowledge graph.
-    Used by the React UI to visualise entity relationships.
-    """
     return entity_graph.get_entity_summary()
+
 
 @app.delete("/clear/documents")
 def clear_documents_only():
-    import os
     from bm25_index import BM25_INDEX_PATH
-
     global collection, client
 
     try:
-        # Delete and immediately recreate
         client.delete_collection("documents")
         collection = client.get_or_create_collection("documents")
-        
-        # Also update the collection reference in retriever and ingest
-        import retriever
-        import ingest
+        import retriever, ingest
         retriever.collection = collection
         ingest.collection = collection
-
     except Exception as e:
         return {"error": f"ChromaDB clear failed: {e}"}
 
@@ -163,21 +205,17 @@ def clear_documents_only():
 
 @app.delete("/clear")
 def clear_all_data():
-    import os
     from bm25_index import BM25_INDEX_PATH
     from entity_graph import GRAPH_PATH
     from structured_parser import SQLITE_DB_PATH
 
     global collection, client
-
     results = {}
 
     try:
         client.delete_collection("documents")
         collection = client.get_or_create_collection("documents")
-
-        import retriever
-        import ingest
+        import retriever, ingest
         retriever.collection = collection
         ingest.collection = collection
         results["chromadb"] = "cleared"
@@ -211,65 +249,23 @@ def clear_all_data():
 
     return {"message": "All data cleared.", "details": results}
 
+
 @app.delete("/clear/structured")
 def clear_structured_only():
-    """Clear only CSV/Excel data from SQLite."""
-    import os
     from structured_parser import SQLITE_DB_PATH
-    
     if os.path.exists(SQLITE_DB_PATH):
         os.remove(SQLITE_DB_PATH)
         return {"message": "Structured data cleared. PDF/text data untouched."}
     return {"message": "No structured data found."}
 
+
 @app.get("/debug/chunks")
 def debug_chunks():
-    """Show what's actually stored in ChromaDB — first 5 chunks."""
-    results = collection.get(
-        limit=5,
-        include=["documents", "metadatas"]
-    )
+    results = collection.get(limit=5, include=["documents", "metadatas"])
     return {
         "total_chunks": collection.count(),
         "sample_chunks": [
-            {
-                "text": doc[:300],
-                "metadata": meta
-            }
-            for doc, meta in zip(
-                results["documents"],
-                results["metadatas"]
-            )
+            {"text": doc[:300], "metadata": meta}
+            for doc, meta in zip(results["documents"], results["metadatas"])
         ]
     }
-
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    filename = file.filename
-    ext = os.path.splitext(filename)[1].lower()
-
-    all_supported = PDF_EXTENSIONS | STRUCTURED_EXTS | DOCUMENT_EXTS
-
-    if ext not in all_supported:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type '{ext}'. Supported: {sorted(all_supported)}"
-        )
-
-    file_path = f"uploads/{filename}"
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    try:
-        if ext == '.pdf':
-            result = ingest_pdf(file_path, filename)
-        elif ext in STRUCTURED_EXTS:
-            result = ingest_structured(file_path, filename)
-        else:
-            result = ingest_document(file_path, filename)
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-    return result
-
