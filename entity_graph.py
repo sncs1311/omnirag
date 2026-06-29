@@ -252,6 +252,9 @@ class EntityGraph:
             data = json.load(f)
         if not data or "nodes" not in data:
             return
+        # networkx 3.2.1 defaults to 'links' key, but our JSON uses 'edges'
+        if "edges" in data:
+            data["links"] = data.pop("edges")
         self.graph = nx.node_link_graph(data)
 
 
